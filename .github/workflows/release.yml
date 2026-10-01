@@ -1,0 +1,144 @@
+name: release
+
+# Builds release binaries and publishes them on a GitHub Release.
+#
+#   git tag v1.0.0 && git push origin v1.0.0
+#
+# A manual run (Actions tab -> release -> Run workflow) builds and uploads the
+# binaries as workflow artifacts without creating a release.
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: build (${{ matrix.target }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: linux-x64
+            os: ubuntu-22.04
+            cmake_args: -DONECONV_STATIC=ON
+          - target: linux-arm64
+            os: ubuntu-22.04-arm
+            cmake_args: -DONECONV_STATIC=ON
+          - target: macos-universal
+            os: macos-14
+            # One binary for Apple Silicon and Intel Macs; std::filesystem needs macOS 10.15+
+            cmake_args: -DCMAKE_OSX_ARCHITECTURES="arm64;x86_64" -DCMAKE_OSX_DEPLOYMENT_TARGET=10.15
+          - target: windows-x64
+            os: windows-2022
+            cmake_args: -DONECONV_STATIC=ON -A x64
+          - target: windows-arm64
+            os: windows-2022
+            cmake_args: -DONECONV_STATIC=ON -A ARM64
+            cross: true
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Determine version
+        id: version
+        shell: bash
+        run: |
+          if [[ "$GITHUB_REF" == refs/tags/v* ]]; then
+            version="${GITHUB_REF_NAME#v}"
+          else
+            version="$(sed -n 's/^project(oneconv VERSION \([0-9.]*\).*/\1/p' CMakeLists.txt)-dev+${GITHUB_SHA::7}"
+          fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "Building oneconv $version"
+
+      - name: Configure
+        shell: bash
+        run: >
+          cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
+          -DONECONV_VERSION_STRING="${{ steps.version.outputs.version }}"
+          ${{ matrix.cmake_args }}
+
+      - name: Build
+        run: cmake --build build --config Release --parallel
+
+      - name: Test
+        if: ${{ !matrix.cross }}
+        run: ctest --test-dir build -C Release --output-on-failure
+
+      - name: Package
+        id: package
+        shell: bash
+        run: |
+          set -euo pipefail
+          name="oneconv-${{ steps.version.outputs.version }}-${{ matrix.target }}"
+          mkdir -p "dist/$name"
+          if [[ "${{ runner.os }}" == "Windows" ]]; then
+            cp build/Release/oneconv.exe "dist/$name/"
+          else
+            cp build/oneconv "dist/$name/"
+            strip "dist/$name/oneconv" || true
+          fi
+          cp README.md LICENSE "dist/$name/"
+          cd dist
+          if [[ "${{ runner.os }}" == "Windows" ]]; then
+            7z a -tzip -bso0 "$name.zip" "$name"
+            archive="$name.zip"
+          else
+            tar -czf "$name.tar.gz" "$name"
+            archive="$name.tar.gz"
+          fi
+          echo "archive=dist/$archive" >> "$GITHUB_OUTPUT"
+
+      - name: Smoke test
+        if: ${{ !matrix.cross }}
+        shell: bash
+        run: |
+          bin=$(find dist -mindepth 2 -maxdepth 2 -type f \( -name oneconv -o -name oneconv.exe \) | head -1)
+          "$bin" --version
+          if [[ "${{ runner.os }}" == "macOS" ]]; then lipo -info "$bin"; fi
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: oneconv-${{ matrix.target }}
+          path: ${{ steps.package.outputs.archive }}
+          if-no-files-found: error
+
+  release:
+    name: publish release
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Checksums
+        run: |
+          cd dist
+          sha256sum -- * > SHA256SUMS.txt
+          cat SHA256SUMS.txt
+
+      - name: Create release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          tag="${GITHUB_REF_NAME}"
+          flags=()
+          # Tags like v1.2.0-rc1 or v1.2.0-beta are published as pre-releases
+          if [[ "$tag" == *-* ]]; then flags+=(--prerelease); fi
+          if gh release view "$tag" >/dev/null 2>&1; then
+            # Release already exists (e.g. drafted by hand or a re-run): replace the assets
+            gh release upload "$tag" dist/* --clobber
+          else
+            gh release create "$tag" dist/* --title "oneconv ${tag#v}" --generate-notes --verify-tag "${flags[@]}"
+          fi
