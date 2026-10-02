@@ -46,12 +46,14 @@ void usage(std::ostream& os) {
           "\n"
           "Options:\n"
           "  -o, --output DIR        output directory (default: ./<input>-export)\n"
-          "  -f, --format FORMAT     md, html, both or obsidian (default: md)\n"
+          "  -f, --format FORMAT     md, html, both, obsidian or enex (default: md)\n"
           "                          obsidian writes an Obsidian vault: [[wikilinks]], embeds,\n"
           "                          #tags, ==highlights== and note properties\n"
+          "                          enex writes Evernote export files (one .enex per section)\n"
+          "                          for Evernote, Apple Notes, Joplin, Notion and others\n"
           "      --html-layout MODE  flow (default) or canvas (absolute positions like OneNote)\n"
           "      --heading-offset N  shift OneNote headings down N levels (default: 1, so\n"
-          "                          Heading 1 becomes ## below the page title; 0 for obsidian)\n"
+          "                          Heading 1 becomes ## below the page title; 0 for obsidian/enex)\n"
           "      --no-front-matter   do not write YAML front matter in Markdown pages\n"
           "      --no-html-in-md     pure Markdown: drop <u>, <sup>, <sub> and <mark>\n"
           "      --no-ink            do not export ink drawings / handwriting\n"
@@ -129,7 +131,11 @@ int run(const std::vector<std::string>& args) {
         } else if (a == "-f" || a == "--format") {
             std::string f = to_lower(value("--format"));
             opts.flavor = render::MdFlavor::Standard;
-            if (f == "md" || f == "markdown") {
+            opts.enex = false;
+            if (f == "enex" || f == "evernote") {
+                opts.markdown = opts.html = false;
+                opts.enex = true;
+            } else if (f == "md" || f == "markdown") {
                 opts.markdown = true;
                 opts.html = false;
             } else if (f == "obsidian") {
@@ -142,7 +148,7 @@ int run(const std::vector<std::string>& args) {
             } else if (f == "both" || f == "all") {
                 opts.markdown = opts.html = true;
             } else {
-                throw std::runtime_error("unknown format '" + f + "' (use md, html, both or obsidian)");
+                throw std::runtime_error("unknown format '" + f + "' (use md, html, both, obsidian or enex)");
             }
         } else if (a == "--html-layout") {
             std::string m = to_lower(value("--html-layout"));
@@ -181,7 +187,8 @@ int run(const std::vector<std::string>& args) {
     Log::level() = static_cast<LogLevel>(std::min(verbosity, 3));
     // An Obsidian note has no "# Title" line (the file name is the title), so OneNote's
     // Heading 1 can be a real top-level heading unless the user asked otherwise.
-    if (opts.flavor == render::MdFlavor::Obsidian && !heading_offset_set) opts.heading_offset = 0;
+    // The same holds for Evernote notes, whose title is stored outside the note body.
+    if ((opts.flavor == render::MdFlavor::Obsidian || opts.enex) && !heading_offset_set) opts.heading_offset = 0;
 
     if (inputs.empty()) {
         usage(std::cerr);
@@ -208,10 +215,10 @@ int run(const std::vector<std::string>& args) {
             } else {
                 out = u8path(sanitize_filename(nb.name) + "-export");
             }
-            render::ExportStats st = render::export_notebook(nb, out, opts);
+            render::ExportStats st = opts.enex ? render::export_enex(nb, out, opts) : render::export_notebook(nb, out, opts);
             std::string summary = "✓ " + nb.name + ": " + std::to_string(st.pages) + " pages from " +
                                   std::to_string(st.sections) + " sections, " + std::to_string(st.assets) +
-                                  " files -> " + path_utf8(out);
+                                  (opts.enex ? " embedded files -> " : " files -> ") + path_utf8(out);
             Log::info(summary);
             if (st.encrypted_sections) Log::info("  " + std::to_string(st.encrypted_sections) + " password-protected section(s) skipped");
             if (st.failed_sections) {

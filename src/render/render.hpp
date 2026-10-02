@@ -32,6 +32,10 @@ struct ExportStats {
 /// Write a whole notebook (or a single section wrapped in a notebook) to `out_dir`.
 ExportStats export_notebook(const model::Notebook& notebook, const fs::path& out_dir, const Options& opts);
 
+/// Write a notebook as Evernote export files: one .enex per section (section groups become
+/// folders), one note per page, with images, attachments and ink embedded.
+ExportStats export_enex(const model::Notebook& notebook, const fs::path& out_dir, const Options& opts);
+
 /// Shared stylesheet used by HTML pages and the index.
 const char* html_stylesheet();
 

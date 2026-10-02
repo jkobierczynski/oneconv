@@ -23,6 +23,7 @@ endif()
 set(ONECONV_LIB_SOURCES
   src/util/guid.cpp
   src/util/text.cpp
+  src/util/md5.cpp
   src/onestore/propset.cpp
   src/onestore/desktop.cpp
   src/onestore/packaging.cpp
@@ -33,6 +34,8 @@ set(ONECONV_LIB_SOURCES
   src/render/markdown.cpp
   src/render/html.cpp
   src/render/export.cpp
+  src/render/enex.cpp
+  src/render/raster.cpp
   src/cab/cab.cpp
   src/cab/inflate.cpp
   src/cab/lzx.cpp

@@ -15,6 +15,7 @@
 #include "onestore/store.hpp"
 #include "render/render.hpp"
 #include "util/guid.hpp"
+#include "util/md5.hpp"
 #include "util/text.hpp"
 
 #include "fixtures.inc"
@@ -370,6 +371,221 @@ static void test_obsidian_render() {
     std::filesystem::remove_all(tmp, ec);
 }
 
+static void test_md5_base64() {
+    auto md5s = [](const std::string& t) { return md5_hex(reinterpret_cast<const uint8_t*>(t.data()), t.size()); };
+    // RFC 1321 test suite
+    CHECK_EQ(md5s(""), std::string("d41d8cd98f00b204e9800998ecf8427e"));
+    CHECK_EQ(md5s("abc"), std::string("900150983cd24fb0d6963f7d28e17f72"));
+    CHECK_EQ(md5s("message digest"), std::string("f96b697d7cb7938d525a2f31aaf161d0"));
+    CHECK_EQ(md5s("12345678901234567890123456789012345678901234567890123456789012345678901234567890"),
+             std::string("57edf4a22be3c955ac49da2e2107b67a"));
+    CHECK_EQ(md5s(std::string(55, 'a')), std::string("ef1772b6dff9a122358552954ad0df65"));  // padding boundaries
+    CHECK_EQ(md5s(std::string(56, 'a')), std::string("3b0c8ac703f828b04c6c197006d17218"));
+    CHECK_EQ(md5s(std::string(64, 'a')), std::string("014842d480b571495a4a0363793f7367"));
+    auto b64 = [](const std::string& t) { return base64(reinterpret_cast<const uint8_t*>(t.data()), t.size()); };
+    CHECK_EQ(b64(""), std::string(""));
+    CHECK_EQ(b64("f"), std::string("Zg=="));
+    CHECK_EQ(b64("fo"), std::string("Zm8="));
+    CHECK_EQ(b64("foobar"), std::string("Zm9vYmFy"));
+    std::ostringstream wrapped;
+    std::string long_text(100, 'x');
+    write_base64(wrapped, reinterpret_cast<const uint8_t*>(long_text.data()), long_text.size(), 76);
+    CHECK_EQ(wrapped.str().find('\n'), size_t(76));
+}
+
+static uint32_t be32(const uint8_t* p) { return (uint32_t(p[0]) << 24) | (uint32_t(p[1]) << 16) | (uint32_t(p[2]) << 8) | p[3]; }
+
+static void test_ink_png() {
+    using namespace model;
+    Ink ink;
+    InkStroke red;
+    red.color = 0x0000FF;  // COLORREF: red
+    red.width = red.height = 53;
+    for (int i = 0; i <= 40; ++i) red.points.emplace_back(100.0f * static_cast<float>(i), 50.0f * static_cast<float>(i % 7));
+    ink.strokes.push_back(red);
+    render::PngImage png = render::ink_to_png(ink);
+    CHECK(png.width > 100 && png.height > 5);
+    const Buffer& d = png.data;
+    CHECK(d.size() > 60 && std::memcmp(d.data(), "\x89PNG\r\n\x1a\n", 8) == 0);
+    if (d.size() <= 60) return;
+    // Walk the chunks, then inflate the image data with the project's own decoder
+    int w = 0, h = 0;
+    Buffer idat;
+    bool end = false;
+    for (size_t pos = 8; pos + 12 <= d.size();) {
+        uint32_t len = be32(&d[pos]);
+        std::string type(reinterpret_cast<const char*>(&d[pos + 4]), 4);
+        if (pos + 12 + len > d.size()) break;
+        if (type == "IHDR") {
+            w = static_cast<int>(be32(&d[pos + 8]));
+            h = static_cast<int>(be32(&d[pos + 12]));
+            CHECK_EQ(int(d[pos + 16]), 8);  // bit depth
+            CHECK_EQ(int(d[pos + 17]), 2);  // colour type RGB
+        }
+        if (type == "IDAT") idat.insert(idat.end(), d.begin() + static_cast<long>(pos + 8), d.begin() + static_cast<long>(pos + 8 + len));
+        if (type == "IEND") end = true;
+        pos += 12 + len;
+    }
+    CHECK(end);
+    CHECK_EQ(w, png.width * 2);  // rendered at twice the display size
+    CHECK(idat.size() > 6);
+    Buffer raw;
+    cab::inflate_append(idat.data() + 2, idat.size() - 6, raw, size_t(1) << 28);  // strip zlib header and Adler-32
+    size_t stride = static_cast<size_t>(w) * 3 + 1;
+    CHECK_EQ(raw.size(), stride * static_cast<size_t>(h));
+    uint32_t a = 1, b = 0;
+    for (uint8_t byte : raw) {
+        a = (a + byte) % 65521;
+        b = (b + a) % 65521;
+    }
+    CHECK_EQ((b << 16) | a, be32(&idat[idat.size() - 4]));
+    size_t red_px = 0, white_px = 0;
+    for (int y = 0; y < h && raw.size() == stride * static_cast<size_t>(h); ++y) {
+        const uint8_t* row = &raw[static_cast<size_t>(y) * stride];
+        CHECK(row[0] == 0);
+        for (int x = 0; x < w; ++x) {
+            const uint8_t* p = row + 1 + x * 3;
+            if (p[0] == 255 && p[1] == 0 && p[2] == 0) ++red_px;
+            if (p[0] == 255 && p[1] == 255 && p[2] == 255) ++white_px;
+        }
+    }
+    CHECK(red_px > 200);                // the stroke was drawn in its colour
+    CHECK(white_px > red_px);           // on a white background
+    CHECK(d.size() < raw.size() / 4);   // and the encoder actually compresses
+    CHECK(render::ink_to_png(Ink()).data.empty());
+}
+
+static std::string slurp(const std::filesystem::path& p) {
+    std::ifstream f(p, std::ios::binary);
+    std::stringstream ss;
+    ss << f.rdbuf();
+    return ss.str();
+}
+
+static void test_enex_export() {
+    using namespace model;
+    auto section = std::make_shared<Section>();
+    section->name = "Work: notes";
+    Page page;
+    page.title = "  Plan <A&B>\n";
+    page.created = "2024-01-02T03:04:05Z";
+    page.modified = "2024-02-03T04:05:06Z";
+    page.author = "J. K.";
+    auto outline = std::make_shared<Outline>();
+
+    Paragraph task = para("buy milk");
+    NoteTag todo;
+    todo.shape = 3;
+    todo.completed = true;
+    todo.label = "To Do";
+    task.tags.push_back(todo);
+    outline->elements.push_back(element(task));
+
+    Paragraph star = para("remember ]]> this");
+    NoteTag imp;
+    imp.shape = 13;
+    imp.label = "Important, urgent";
+    star.tags.push_back(imp);
+    outline->elements.push_back(element(star));
+
+    Paragraph links;
+    Inline ext;
+    ext.text = "site";
+    ext.href = "https://example.com/?a=1&b=2";
+    Inline internal;
+    internal.text = "other page";
+    internal.href = "onenote:#Other&page-id={88D803A5-4F43-48D4-9B16-4C024F5787DC}&end";
+    Inline evil;
+    evil.text = "x";
+    evil.href = "javascript:alert(1)";
+    links.inlines = {ext, internal, evil};
+    outline->elements.push_back(element(links));
+    outline->elements.push_back(element(para("Heading", "h2")));
+
+    OutlineElement bullet = element(para("item"));
+    bullet.list = ListFormat();
+    outline->elements.push_back(bullet);
+
+    Blob picture = Blob::from_vector({0x89, 'P', 'N', 'G', 1, 2, 3, 4});
+    for (int i = 0; i < 2; ++i) {  // the same picture twice must be stored once
+        auto image = std::make_shared<Image>();
+        image->data = picture;
+        image->ext = ".png";
+        image->width = 4.0f;
+        image->height = 2.0f;
+        OutlineElement el;
+        Content c;
+        c.kind = Content::Kind::Image;
+        c.image = image;
+        el.contents.push_back(c);
+        outline->elements.push_back(el);
+    }
+    auto doc = std::make_shared<Attachment>();
+    doc->data = Blob::from_vector({'h', 'e', 'l', 'l', 'o'});
+    doc->name = "report.docx";
+    OutlineElement doc_el;
+    Content dc;
+    dc.kind = Content::Kind::Attachment;
+    dc.attachment = doc;
+    doc_el.contents.push_back(dc);
+    outline->elements.push_back(doc_el);
+
+    PageItem pi;
+    pi.outline = outline;
+    page.items.push_back(pi);
+    section->pages.push_back(page);
+    section->pages.push_back(Page());  // an empty, untitled page
+
+    Notebook nb;
+    nb.name = "NB";
+    auto group = std::make_shared<SectionGroup>();
+    group->name = "Group";
+    NotebookEntry se;
+    se.section = section;
+    group->entries.push_back(se);
+    NotebookEntry ge;
+    ge.group = group;
+    nb.entries.push_back(ge);
+
+    render::Options opts;
+    opts.enex = true;
+    opts.heading_offset = 0;
+    auto tmp = std::filesystem::temp_directory_path() / "oneconv_test_enex";
+    std::error_code ec;
+    std::filesystem::remove_all(tmp, ec);
+    render::ExportStats st = render::export_enex(nb, tmp, opts);
+    CHECK_EQ(st.sections, 1);
+    CHECK_EQ(st.pages, 2);
+    CHECK_EQ(st.assets, 2);
+    std::string x = slurp(tmp / "Group" / "Work_ notes.enex");
+    CHECK(x.find("<!DOCTYPE en-export SYSTEM \"http://xml.evernote.com/pub/evernote-export4.dtd\">") != std::string::npos);
+    CHECK(x.find("<title>Plan &lt;A&amp;B&gt;</title>") != std::string::npos);
+    CHECK(x.find("<title>Untitled Page</title>") != std::string::npos);
+    CHECK(x.find("<created>20240102T030405Z</created>\n<updated>20240203T040506Z</updated>") != std::string::npos);
+    CHECK(x.find("<tag>Important  urgent</tag>") != std::string::npos);      // commas are not allowed in tag names
+    CHECK(x.find("<tag>To Do</tag>") == std::string::npos);                    // a plain task is not a tag
+    CHECK(x.find("<note-attributes><author>J. K.</author></note-attributes>") != std::string::npos);
+    CHECK(x.find("<div><en-todo checked=\"true\"/>buy milk</div>") != std::string::npos);
+    CHECK(x.find("remember ]]&gt; this") != std::string::npos);                 // cannot close the CDATA section
+    CHECK(x.find("<a href=\"https://example.com/?a=1&amp;b=2\">site</a>other pagex</div>") != std::string::npos);
+    CHECK(x.find("javascript") == std::string::npos);
+    CHECK(x.find("onenote:") == std::string::npos);
+    CHECK(x.find("<h2>Heading</h2>") != std::string::npos);
+    CHECK(x.find("<ul><li><div>item</div></li></ul>") != std::string::npos);
+    const uint8_t png_bytes[] = {0x89, 'P', 'N', 'G', 1, 2, 3, 4};
+    std::string hash = md5_hex(png_bytes, sizeof png_bytes);
+    std::string media = "<en-media type=\"image/png\" hash=\"" + hash + "\" width=\"192\" height=\"96\"/>";
+    size_t first = x.find(media);
+    CHECK(first != std::string::npos && x.find(media, first + 1) != std::string::npos);  // referenced twice
+    CHECK(x.find("<data encoding=\"base64\">\niVBORwECAwQ=\n</data>\n<mime>image/png</mime>\n<width>192</width>") != std::string::npos);
+    CHECK(x.find("iVBORwECAwQ=") == x.rfind("iVBORwECAwQ="));                    // ...but stored once
+    CHECK(x.find("<file-name>report.docx</file-name><attachment>true</attachment>") != std::string::npos);
+    CHECK(x.find("application/vnd.openxmlformats-officedocument.wordprocessingml.document") != std::string::npos);
+    CHECK(x.find("<en-note><div><br/></div></en-note>") != std::string::npos);  // the empty page
+    CHECK(x.rfind("</en-export>\n") == x.size() - 13);
+    std::filesystem::remove_all(tmp, ec);
+}
+
 static void test_internal_links() {
     render::Options opts;
     render::LinkTable links;
@@ -399,6 +615,9 @@ int main() {
     test_garbage_store();
     test_markdown_render();
     test_obsidian_render();
+    test_md5_base64();
+    test_ink_png();
+    test_enex_export();
     test_internal_links();
     std::cout << g_passed << " checks passed, " << g_failed << " failed\n";
     return g_failed ? 1 : 0;

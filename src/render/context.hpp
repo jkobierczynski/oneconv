@@ -23,6 +23,7 @@ enum class MdFlavor {
 
 struct Options {
     MdFlavor flavor = MdFlavor::Standard;
+    bool enex = false;           // write Evernote export files (.enex) instead of pages
     bool markdown = true;
     bool html = false;
     bool front_matter = true;    // YAML front matter in Markdown pages
@@ -94,6 +95,16 @@ struct PageContext {
 std::string ink_to_svg(const model::Ink& ink, bool standalone, const std::string& title = "");
 /// Natural size of an ink drawing in CSS pixels.
 std::pair<double, double> ink_size_px(const model::Ink& ink);
+
+/// A raster image and the size (in CSS pixels) it is meant to be shown at.
+struct PngImage {
+    Buffer data;
+    int width = 0;
+    int height = 0;
+};
+/// Render an ink drawing to a PNG on a white background (2x resolution, anti-aliased).
+/// For formats such as ENEX whose readers cannot display SVG. Empty if there is no ink.
+PngImage ink_to_png(const model::Ink& ink);
 
 /// Replace the characters that cannot appear in an Obsidian link target (# ^ [ ] |).
 std::string wiki_safe_name(const std::string& name);

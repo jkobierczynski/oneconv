@@ -1,6 +1,7 @@
 # oneconv
 
-Convert Microsoft OneNote notebooks to **Markdown**, **HTML** or an **Obsidian** vault.
+Convert Microsoft OneNote notebooks to **Markdown**, **HTML**, an **Obsidian** vault or
+**Evernote export files** (ENEX).
 
 `oneconv` is a self-contained C++17 command-line tool. It reads OneNote's native
 binary format directly, so it needs neither OneNote, Windows, nor the Microsoft Graph API.
@@ -49,10 +50,10 @@ sections. Encrypted sections are detected, reported and skipped.
 oneconv [options] <input>...
 
   -o, --output DIR        output directory (default: ./<input>-export)
-  -f, --format FORMAT     md, html, both or obsidian (default: md)
+  -f, --format FORMAT     md, html, both, obsidian or enex (default: md)
       --html-layout MODE  flow (default) or canvas (absolute positions like OneNote)
       --heading-offset N  shift OneNote headings down N levels (default 1:
-                          Heading 1 becomes ## below the page title; 0 for obsidian)
+                          Heading 1 becomes ## below the page title; 0 for obsidian/enex)
       --no-front-matter   no YAML front matter in Markdown pages
       --no-html-in-md     pure Markdown: drop <u>, <sup>, <sub> and <mark>
       --no-ink            skip ink drawings / handwriting
@@ -74,6 +75,9 @@ oneconv -o notes "Meeting Notes.one"
 
 # Straight into an Obsidian vault
 oneconv -f obsidian -o ~/Vault/OneNote Work.onepkg
+
+# Evernote export files, one per section, to import into Evernote, Apple Notes, Notion, ...
+oneconv -f enex -o ~/enex Work.onepkg
 
 # What's inside a package?
 oneconv --list Project.onepkg
@@ -128,6 +132,44 @@ Details:
   point at the wrong file.
 * Text that would accidentally become Obsidian syntax (`#word`, `==`, `%%`) is escaped.
 * Links into notebooks that are not part of the export stay `onenote:` links.
+
+### Evernote (ENEX)
+
+`-f enex` writes Evernote's export format, which Evernote itself and many other note
+applications (Apple Notes, Notion, Joplin, Bear, UpNote, …) can import. Each section becomes
+one self-contained `.enex` file with a note per page; section groups become folders:
+
+```
+enex/
+├── Meeting Notes.enex               one notebook's worth of notes: import it as a notebook
+└── Projects/                        a section group
+    └── Roadmap.enex
+```
+
+| OneNote | In the note |
+|---|---|
+| Page title, created / modified time, author | note title, dates and author |
+| Headings, lists, tables, quotes, text formatting, colours | the same in ENML, Evernote's XHTML subset |
+| Highlighted text | Evernote highlight |
+| Code paragraphs | Evernote code block |
+| To-do tags | Evernote checkboxes (`<en-todo>`) |
+| Other tags (Important, Question, …) | their symbol in the text, plus an Evernote tag on the note |
+| Images | embedded at the size they had in OneNote |
+| Attached files, audio and video recordings | embedded attachments |
+| Ink and handwriting | embedded PNG picture (Evernote does not display SVG) |
+| Equations | LaTeX source, `$…$` |
+| Hyperlinks | links |
+
+Details:
+
+* Everything a note needs is inside the `.enex` file (attachments are base64-encoded), so
+  the files are larger than the Markdown export and no `assets` folders are written.
+* The format has no notion of subpages, section groups or links between notes: subpages
+  become ordinary notes in page order, and links between OneNote pages become plain text.
+* An attachment used several times on a page is stored once.
+* Evernote accepts at most 200 MB per note; `oneconv` warns when a page is larger.
+* For Joplin and Obsidian the `md` and `obsidian` formats give better results than
+  importing ENEX, because they keep page links and equations.
 
 ### Getting your notebooks as files
 
@@ -191,10 +233,14 @@ binaries use), `-DONECONV_VERSION_STRING=x.y.z` sets the version shown by `--ver
 
 * `oneconv_tests` — unit tests: GUID/ExGUID encodings, UTF-16 decoding, property set
   reference bookkeeping, equation → LaTeX/MathML, DEFLATE and LZX decoding (fixtures
-  cross-checked against `cabextract`), Markdown/HTML/Obsidian rendering and link rewriting.
+  cross-checked against `cabextract`), Markdown/HTML/Obsidian/ENEX rendering, link
+  rewriting, MD5/base64 and the PNG encoder.
 * `tests/run_samples.sh` — fetches the public OneNote sample corpora of the
   [onenote.rs](https://github.com/msiemens/onenote.rs) and
   [Apache Tika](https://github.com/apache/tika) projects and converts every file.
+* `tests/check_enex.py` — checks `.enex` files against Evernote's published rules: element
+  order, permitted ENML elements and attributes, link schemes, and that every `<en-media>`
+  hash matches the MD5 of an embedded resource. `python3 tests/check_enex.py <dir>`.
 * `tests/make_lzx_cab.py` — a small LZX cabinet writer used to produce test `.onepkg`
   files (verbatim, aligned-offset and uncompressed blocks).
 
@@ -204,14 +250,17 @@ OneNote files and cabinets under AddressSanitizer/UBSan without crashes or hangs
 The Obsidian output was checked in Obsidian 1.13 itself: a test vault of 69 exported notes
 was opened and its link index queried, and all 159 links and embeds resolved to the
 intended files, including same-named pages and exports placed in a subfolder of the vault.
+The ENEX output of all samples passes `tests/check_enex.py` and `xmllint`, and was imported
+into Joplin (all notes arrived, with every attachment intact); it has not been tested in
+the Evernote application itself.
 
 ## Source layout
 
 ```
-src/util/       byte reader, GUIDs, UTF-8/16 helpers, logging
+src/util/       byte reader, GUIDs, UTF-8/16 helpers, MD5/base64, logging
 src/onestore/   MS-ONESTORE: desktop revision store, FSSHTTPB packaging, property sets
 src/one/        MS-ONE object model → document model (pages, outlines, rich text, ink, math)
-src/render/     Markdown and HTML renderers, asset writer, notebook exporter
+src/render/     Markdown, HTML and ENEX renderers, ink → SVG/PNG, asset writer, notebook exporter
 src/cab/        Cabinet reader with LZX and DEFLATE (MSZIP) decoders for .onepkg
 src/app/        input discovery and command line
 ```
@@ -224,7 +273,9 @@ src/app/        input discovery and command line
   Excel/Visio content is exported as the attachment, not as a rendered table.
 * Markdown has no free-form layout: content positioned side by side on a page is
   emitted in reading order. Use `-f html --html-layout canvas` to keep the layout.
-* Ink is exported as vector strokes; pressure-sensitive stroke width is not reproduced.
+* Ink is exported as vector strokes (a PNG picture in ENEX); pressure-sensitive stroke
+  width is not reproduced.
+* ENEX cannot express subpage hierarchy or links between notes (see above).
 
 ## Acknowledgements
 

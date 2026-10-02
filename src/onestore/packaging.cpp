@@ -139,13 +139,13 @@ void expect_header(Reader& r, uint32_t type) {
 
 bool at_end8(Reader& r, uint32_t type) {
     if (r.eof()) throw ParseError("unexpected end of packaging data");
-    uint8_t b = r.peek_u8();
-    return (b & 0x3) == 1 && (b >> 2) == type;
+    const uint32_t b = r.peek_u8();
+    return (b & 0x3u) == 1u && (b >> 2) == type;
 }
 
 void expect_end8(Reader& r, uint32_t type) {
-    uint8_t b = r.u8();
-    if ((b & 0x3) != 1 || (b >> 2) != type) throw ParseError(cat("expected 8-bit end of stream object 0x", std::hex, type));
+    const uint32_t b = r.u8();
+    if ((b & 0x3u) != 1u || (b >> 2) != type) throw ParseError(cat("expected 8-bit end of stream object 0x", std::hex, type));
 }
 
 struct StorageIndex {
