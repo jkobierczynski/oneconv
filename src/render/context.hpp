@@ -15,7 +15,14 @@ namespace oneconv::render {
 
 namespace fs = std::filesystem;
 
+/// Markdown dialect.
+enum class MdFlavor {
+    Standard,  // CommonMark + GitHub extensions, relative links
+    Obsidian,  // an Obsidian vault: wikilinks, embeds, #tags, properties
+};
+
 struct Options {
+    MdFlavor flavor = MdFlavor::Standard;
     bool markdown = true;
     bool html = false;
     bool front_matter = true;    // YAML front matter in Markdown pages
@@ -29,7 +36,11 @@ struct Options {
 /// Writes binary assets next to pages, de-duplicating identical blobs.
 class AssetWriter {
 public:
-    explicit AssetWriter(fs::path dir) : dir_(std::move(dir)) {}
+    /// `shared_names` (optional) makes file names unique across several writers, so that
+    /// a file can be referenced by its bare name from anywhere (Obsidian embeds).
+    /// `wiki_safe` keeps characters out of file names that break Obsidian links.
+    explicit AssetWriter(fs::path dir, std::set<std::string>* shared_names = nullptr, bool wiki_safe = false)
+        : dir_(std::move(dir)), shared_(shared_names), wiki_safe_(wiki_safe) {}
 
     /// Write `data` under a unique name derived from `preferred`; returns the file path.
     fs::path write(const Blob& data, const std::string& preferred);
@@ -40,6 +51,8 @@ public:
 
 private:
     fs::path dir_;
+    std::set<std::string>* shared_ = nullptr;
+    bool wiki_safe_ = false;
     std::set<std::string> used_;  // lower-cased file names
     std::map<std::tuple<const void*, size_t, size_t>, fs::path> written_;
     fs::path unique_path(const std::string& preferred);
@@ -50,6 +63,7 @@ struct LinkTable {
     struct Target {
         fs::path md;
         fs::path html;
+        std::string wiki;  // Obsidian wikilink target (note name, or path when the name is ambiguous)
     };
     std::map<std::string, Target> pages;     // page id (upper-case braced GUID) -> files
     std::map<std::string, Target> sections;  // section id -> first page
@@ -65,7 +79,11 @@ struct PageContext {
     int image_counter = 0;
     int ink_counter = 0;
     bool for_html = false;
+    std::string stem;         // file name of the page without extension
+    std::string parent_wiki;  // Obsidian: wikilink target of the parent page (subpages)
 
+    /// The exported page a OneNote-internal (onenote:) link points to, if it is part of this export.
+    const LinkTable::Target* find_internal(const std::string& href) const;
     /// Resolve a hyperlink target, rewriting OneNote-internal links to relative files.
     std::string resolve_link(const std::string& href) const;
     /// Relative URL from the page directory to a file.
@@ -76,6 +94,9 @@ struct PageContext {
 std::string ink_to_svg(const model::Ink& ink, bool standalone, const std::string& title = "");
 /// Natural size of an ink drawing in CSS pixels.
 std::pair<double, double> ink_size_px(const model::Ink& ink);
+
+/// Replace the characters that cannot appear in an Obsidian link target (# ^ [ ] |).
+std::string wiki_safe_name(const std::string& name);
 
 /// True for empty or OneNote-generated names such as "Untitled picture.png".
 bool generic_image_name(const std::string& filename);

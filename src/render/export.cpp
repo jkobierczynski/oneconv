@@ -1,8 +1,10 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (C) 2026 Jurgen Kobierczynski
 // Writes a notebook to disk: page files, assets and index pages.
+#include <algorithm>
 #include <fstream>
 #include <functional>
+#include <map>
 #include <set>
 
 #include "../util/log.hpp"
@@ -19,6 +21,8 @@ struct PlannedPage {
     const Page* page = nullptr;
     fs::path md, html;
     std::string stem;
+    std::string wiki;         // Obsidian link target
+    std::string parent_wiki;  // Obsidian link target of the parent page, for subpages
 };
 
 struct PlannedSection {
@@ -51,25 +55,33 @@ void write_file(const fs::path& p, const std::string& content) {
 
 class Exporter {
 public:
-    Exporter(const Notebook& nb, fs::path out, const Options& opts) : nb_(nb), out_(std::move(out)), opts_(opts) {}
+    Exporter(const Notebook& nb, fs::path out, const Options& opts)
+        : nb_(nb), out_(std::move(out)), opts_(opts), obs_(opts.markdown && opts.flavor == MdFlavor::Obsidian) {}
 
     ExportStats run() {
         UniqueNames top;
         top.take("assets");
         top.take("index");
+        // Obsidian: the table of contents is a note named after the notebook
+        // (a file, so it cannot clash with the section folders reserved in `top`)
+        if (obs_) index_stem_ = safe_name(nb_.name);
         plan_entries(nb_.entries, out_, "", top);
+        if (obs_) plan_wikilinks();
 
         // Link table for onenote: links
         for (const auto& ps : sections_) {
             for (const auto& pp : ps.pages) {
-                if (!pp.page->id.empty()) links_.pages[pp.page->id] = {pp.md, pp.html};
+                if (!pp.page->id.empty()) links_.pages[pp.page->id] = {pp.md, pp.html, pp.wiki};
             }
             if (!ps.section->id.empty() && !ps.pages.empty())
-                links_.sections[ps.section->id] = {ps.pages.front().md, ps.pages.front().html};
+                links_.sections[ps.section->id] = {ps.pages.front().md, ps.pages.front().html, ps.pages.front().wiki};
         }
 
         for (auto& ps : sections_) write_section(ps);
-        if (opts_.markdown) write_file(out_ / "index.md", index_markdown());
+        if (obs_)
+            write_file(out_ / u8path(index_stem_ + ".md"), index_obsidian());
+        else if (opts_.markdown)
+            write_file(out_ / "index.md", index_markdown());
         if (opts_.html) write_file(out_ / "index.html", index_html());
         return stats_;
     }
@@ -79,28 +91,73 @@ private:
     fs::path out_;
     const Options& opts_;
     std::vector<PlannedSection> sections_;
+    const bool obs_;
+    std::string index_stem_;
+    std::set<std::string> vault_names_;  // Obsidian: every file name in the export (lower case)
     LinkTable links_;
     ExportStats stats_;
+
+    /// File or folder name; in Obsidian mode also safe to use inside [[links]].
+    std::string safe_name(const std::string& name, size_t max_len = 120) const {
+        std::string s = sanitize_filename(name, max_len);
+        return obs_ ? sanitize_filename(wiki_safe_name(s), max_len) : s;
+    }
+
+    /// Decide how each note is addressed. A name that is unique in the export is linked
+    /// by name alone. Notes that share a name with another one are linked by their path
+    /// from the export folder; Obsidian matches such a path against the end of the file
+    /// path, so the links keep working when the export is put in a subfolder of a vault.
+    void plan_wikilinks() {
+        std::map<std::string, int> count;
+        for (const auto& ps : sections_)
+            for (const auto& pp : ps.pages) ++count[to_lower(pp.stem)];
+        // The contents note must not share its name with a page: "Math/Math" would then
+        // match the contents note "Math.md" inside the export folder "Math" as well.
+        if (count.count(to_lower(index_stem_))) {
+            std::string base = index_stem_ + " (contents)";
+            index_stem_ = base;
+            for (int i = 2; count.count(to_lower(index_stem_)); ++i) index_stem_ = base + " " + std::to_string(i);
+        }
+        for (auto& ps : sections_) {
+            std::vector<PlannedPage*> ancestors;  // most recent page at each level
+            for (auto& pp : ps.pages) {
+                if (count[to_lower(pp.stem)] == 1) {
+                    pp.wiki = pp.stem;
+                } else {
+                    std::string rel = path_utf8(pp.md.lexically_normal().lexically_relative(out_.lexically_normal()));
+                    std::replace(rel.begin(), rel.end(), '\\', '/');
+                    if (ends_with(rel, ".md")) rel.resize(rel.size() - 3);
+                    pp.wiki = rel;
+                }
+                size_t level = static_cast<size_t>(std::max(0, pp.page->level));
+                if (level > 0 && level <= ancestors.size() && ancestors[level - 1]) pp.parent_wiki = ancestors[level - 1]->wiki;
+                ancestors.resize(level + 1);
+                ancestors[level] = &pp;
+                vault_names_.insert(to_lower(pp.stem) + ".md");
+            }
+        }
+        vault_names_.insert(to_lower(index_stem_) + ".md");
+    }
 
     void plan_entries(const std::vector<NotebookEntry>& entries, const fs::path& dir, const std::string& prefix,
                       UniqueNames& names) {
         for (const auto& e : entries) {
             if (e.group) {
-                std::string name = names.take(sanitize_filename(e.group->name));
+                std::string name = names.take(safe_name(e.group->name));
                 UniqueNames inner;
                 inner.take("assets");
                 plan_entries(e.group->entries, dir / u8path(name), prefix + e.group->name + " › ", inner);
             } else if (e.section) {
                 PlannedSection ps;
                 ps.section = e.section.get();
-                ps.dir = dir / u8path(names.take(sanitize_filename(e.section->name)));
+                ps.dir = dir / u8path(names.take(safe_name(e.section->name)));
                 ps.display_path = prefix + e.section->name;
                 UniqueNames page_names;
                 page_names.take("assets");
                 for (const auto& page : e.section->pages) {
                     PlannedPage pp;
                     pp.page = &page;
-                    pp.stem = page_names.take(sanitize_filename(page.title.empty() ? "Untitled Page" : page.title, 80));
+                    pp.stem = page_names.take(safe_name(page.title.empty() ? "Untitled Page" : page.title, 80));
                     pp.md = ps.dir / u8path(pp.stem + ".md");
                     pp.html = ps.dir / u8path(pp.stem + ".html");
                     ps.pages.push_back(pp);
@@ -123,7 +180,8 @@ private:
         ++stats_.sections;
         std::error_code ec;
         fs::create_directories(ps.dir, ec);
-        AssetWriter assets(ps.dir / "assets");
+        // Obsidian embeds address files by name, so asset names are unique across the whole export
+        AssetWriter assets(ps.dir / "assets", obs_ ? &vault_names_ : nullptr, obs_);
         for (size_t i = 0; i < ps.pages.size(); ++i) {
             const PlannedPage& pp = ps.pages[i];
             PageContext ctx;
@@ -132,6 +190,8 @@ private:
             ctx.assets = &assets;
             ctx.page_dir = ps.dir;
             ctx.slug = sanitize_filename(pp.stem, 40);
+            ctx.stem = pp.stem;
+            ctx.parent_wiki = pp.parent_wiki;
             try {
                 if (opts_.markdown) write_file(pp.md, render_markdown(*pp.page, ctx));
                 if (opts_.html) {
@@ -195,6 +255,36 @@ private:
         };
         walk(nb_.entries, 0);
         return s;
+    }
+
+    /// Table of contents note for an Obsidian vault: sections as headings, pages as links.
+    std::string index_obsidian() const {
+        std::string s;
+        std::function<void(const std::vector<NotebookEntry>&, int)> walk = [&](const std::vector<NotebookEntry>& es,
+                                                                                int depth) {
+            for (const auto& e : es) {
+                std::string hashes(static_cast<size_t>(std::min(6, 1 + depth)), '#');
+                if (e.group) {
+                    s += "\n" + hashes + " " + md_escape(e.group->name) + "\n";
+                    walk(e.group->entries, depth + 1);
+                } else if (e.section) {
+                    const PlannedSection* ps = planned(e.section.get());
+                    s += "\n" + hashes + " " + md_escape(e.section->name) + section_note(*e.section) + "\n\n";
+                    if (!ps || e.section->encrypted || !e.section->error.empty()) continue;
+                    for (const auto& pp : ps->pages) {
+                        std::string indent(static_cast<size_t>(std::max(0, pp.page->level)) * 2, ' ');
+                        std::string title = pp.page->title.empty() ? "Untitled Page" : pp.page->title;
+                        std::string label;
+                        for (char c : title)
+                            if (c != '[' && c != ']' && c != '\n') label.push_back(c == '|' ? '-' : c);
+                        s += indent + "- [[" + pp.wiki + (label != pp.wiki ? "|" + label : "") + "]]\n";
+                    }
+                }
+            }
+        };
+        walk(nb_.entries, 0);
+        size_t first = s.find_first_not_of('\n');
+        return first == std::string::npos ? s : s.substr(first);
     }
 
     std::string index_html() const {

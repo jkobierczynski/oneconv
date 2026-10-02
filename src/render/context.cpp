@@ -15,17 +15,26 @@ namespace oneconv::render {
 
 using namespace model;
 
+std::string wiki_safe_name(const std::string& name) {
+    std::string out;
+    for (char c : name) out.push_back(c == '#' || c == '^' || c == '[' || c == ']' || c == '|' ? '_' : c);
+    out = replace_all(out, "%%", "%");
+    return out;
+}
+
 fs::path AssetWriter::unique_path(const std::string& preferred) {
     std::string name = sanitize_filename(preferred, 100);
+    if (wiki_safe_) name = wiki_safe_name(name);
     std::string stem = name, ext;
     size_t dot = name.rfind('.');
     if (dot != std::string::npos && dot > 0) {
         stem = name.substr(0, dot);
         ext = name.substr(dot);
     }
+    std::set<std::string>& used = shared_ ? *shared_ : used_;
     std::string candidate = name;
-    for (int i = 2; used_.count(to_lower(candidate)); ++i) candidate = stem + "-" + std::to_string(i) + ext;
-    used_.insert(to_lower(candidate));
+    for (int i = 2; used.count(to_lower(candidate)); ++i) candidate = stem + "-" + std::to_string(i) + ext;
+    used.insert(to_lower(candidate));
     return dir_ / u8path(candidate);
 }
 
@@ -55,8 +64,8 @@ fs::path AssetWriter::write_text(const std::string& text, const std::string& pre
 
 std::string PageContext::rel(const fs::path& file) const { return relative_link(page_dir, file); }
 
-std::string PageContext::resolve_link(const std::string& href) const {
-    if (!starts_with(to_lower(href), "onenote:") || !links) return href;
+const LinkTable::Target* PageContext::find_internal(const std::string& href) const {
+    if (!starts_with(to_lower(href), "onenote:") || !links) return nullptr;
     auto find_param = [&](const std::string& key) -> std::string {
         std::string lower = to_lower(href);
         size_t p = lower.find(key + "=");
@@ -70,18 +79,22 @@ std::string PageContext::resolve_link(const std::string& href) const {
         if (!up.empty() && up.front() != '{') up = "{" + up + "}";
         return up;
     };
-    auto pick = [&](const LinkTable::Target& t) { return rel(for_html ? t.html : t.md); };
     std::string page = find_param("page-id");
     if (!page.empty()) {
         auto it = links->pages.find(page);
-        if (it != links->pages.end()) return pick(it->second);
+        if (it != links->pages.end()) return &it->second;
     }
     std::string section = find_param("section-id");
     if (!section.empty()) {
         auto it = links->sections.find(section);
-        if (it != links->sections.end()) return pick(it->second);
+        if (it != links->sections.end()) return &it->second;
     }
-    return href;  // link into another notebook: keep it
+    return nullptr;  // link into another notebook
+}
+
+std::string PageContext::resolve_link(const std::string& href) const {
+    if (const LinkTable::Target* t = find_internal(href)) return rel(for_html ? t->html : t->md);
+    return href;
 }
 
 // ---------------------------------------------------------------- ink -> SVG

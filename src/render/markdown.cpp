@@ -1,7 +1,11 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (C) 2026 Jurgen Kobierczynski
-// Markdown (CommonMark + GitHub extensions) page renderer.
+// Markdown page renderer: CommonMark + GitHub extensions, or the Obsidian dialect
+// (wikilinks, embeds, #tags, ==highlights==, properties).
 #include <algorithm>
+#include <cctype>
+#include <cmath>
+#include <cstring>
 
 #include "../util/log.hpp"
 #include "../util/text.hpp"
@@ -34,6 +38,99 @@ std::string md_url(const std::string& url) {
     return url;
 }
 
+/// Obsidian gives meaning to a few sequences that plain Markdown leaves alone.
+std::string obsidian_escape(const std::string& text) {
+    std::string e = md_escape(text);
+    std::string out;
+    out.reserve(e.size() + 4);
+    for (size_t i = 0; i < e.size(); ++i) {
+        char c = e[i];
+        unsigned char next = i + 1 < e.size() ? static_cast<unsigned char>(e[i + 1]) : 0;
+        if (c == '#' && (std::isalnum(next) || next == '_' || next == '-' || next == '/' || next == '\\' || next >= 0x80)) {
+            out += "\\#";  // would become a tag
+        } else if ((c == '=' || c == '%') && next == static_cast<unsigned char>(c)) {
+            out.push_back('\\');  // == highlight, %% comment
+            out.push_back(c);
+            out.push_back('\\');
+            out.push_back(c);
+            ++i;
+        } else {
+            out.push_back(c);
+        }
+    }
+    return out;
+}
+
+/// Keep a paragraph line from being read as a heading, list item or rule.
+std::string escape_line_start(const std::string& l) {
+    if (l.empty()) return l;
+    if (l[0] == '#') {
+        size_t k = 0;
+        while (k < l.size() && l[k] == '#') ++k;
+        if (k <= 6 && (k == l.size() || l[k] == ' ')) return "\\" + l;
+    }
+    if ((l[0] == '-' || l[0] == '+') && (l.size() == 1 || l[1] == ' ')) return "\\" + l;
+    if ((l[0] == '-' || l[0] == '=') && l.find_first_not_of(l[0]) == std::string::npos) return "\\" + l;
+    size_t k = 0;
+    while (k < l.size() && k < 9 && std::isdigit(static_cast<unsigned char>(l[k]))) ++k;
+    if (k > 0 && k < l.size() && (l[k] == '.' || l[k] == ')') && (k + 1 == l.size() || l[k + 1] == ' '))
+        return l.substr(0, k) + "\\" + l.substr(k);
+    return l;
+}
+
+/// OneNote tag label -> Obsidian tag name ("Remember for later" -> "remember-for-later").
+std::string tag_slug(const std::string& label) {
+    std::string out;
+    bool gap = false, non_digit = false;
+    for (uint32_t cp : utf8_codepoints(label)) {
+        bool word = cp >= 0x80 || std::isalnum(static_cast<int>(cp)) || cp == '_';
+        if (!word) {
+            gap = true;
+            continue;
+        }
+        if (gap && !out.empty()) out.push_back('-');
+        gap = false;
+        if (cp < 0x80) {
+            out.push_back(static_cast<char>(std::tolower(static_cast<int>(cp))));
+            if (!std::isdigit(static_cast<int>(cp))) non_digit = true;
+        } else {
+            append_utf8(out, cp);
+            non_digit = true;
+        }
+    }
+    if (!out.empty() && !non_digit) out = "tag-" + out;  // tags may not be purely numeric
+    return out;
+}
+
+bool has_extension(const std::string& name, std::initializer_list<const char*> exts) {
+    std::string l = to_lower(name);
+    for (const char* e : exts)
+        if (ends_with(l, e)) return true;
+    return false;
+}
+
+// File types Obsidian can display inline (https://obsidian.md/help/file-formats)
+bool obsidian_image(const std::string& n) {
+    return has_extension(n, {".avif", ".bmp", ".gif", ".jpeg", ".jpg", ".png", ".svg", ".webp"});
+}
+bool obsidian_embeddable(const std::string& n) {
+    return obsidian_image(n) || has_extension(n, {".flac", ".m4a", ".mp3", ".ogg", ".wav", ".webm", ".3gp", ".mkv",
+                                                  ".mov", ".mp4", ".ogv", ".pdf"});
+}
+
+/// [[target]] or [[target|label]]. Inside tables the pipe has to be escaped.
+std::string wikilink(const std::string& target, const std::string& label, bool in_table, bool embed = false) {
+    std::string text;
+    for (char c : label) {
+        if (c == '[' || c == ']' || c == '\n' || c == '\r') continue;
+        text.push_back(c == '|' ? '-' : c);
+    }
+    text = trim(text);
+    std::string s = std::string(embed ? "![[" : "[[") + target;
+    if (!text.empty() && text != target) s += std::string(in_table ? "\\|" : "|") + text;
+    return s + "]]";
+}
+
 bool md_visible_equal(const TextStyle& a, const TextStyle& b) {
     return a.bold == b.bold && a.italic == b.italic && a.strike == b.strike && a.underline == b.underline &&
            a.superscript == b.superscript && a.subscript == b.subscript &&
@@ -42,21 +139,17 @@ bool md_visible_equal(const TextStyle& a, const TextStyle& b) {
 
 class MarkdownRenderer {
 public:
-    MarkdownRenderer(const Page& page, PageContext& ctx) : page_(page), ctx_(ctx), opts_(*ctx.opts) {}
+    MarkdownRenderer(const Page& page, PageContext& ctx)
+        : page_(page), ctx_(ctx), opts_(*ctx.opts), obs_(ctx.opts->flavor == MdFlavor::Obsidian) {}
 
     std::string render() {
-        if (opts_.front_matter) {
-            out_ += "---\n";
-            out_ += "title: " + yaml_str(page_.title.empty() ? "Untitled Page" : page_.title) + "\n";
-            if (!page_.created.empty()) out_ += "created: " + page_.created + "\n";
-            if (!page_.modified.empty()) out_ += "modified: " + page_.modified + "\n";
-            if (!page_.author.empty()) out_ += "author: " + yaml_str(page_.author) + "\n";
-            if (!page_.id.empty()) out_ += "onenote-id: " + yaml_str(page_.id) + "\n";
-            out_ += "---\n\n";
+        const std::string title = page_.title.empty() ? "Untitled Page" : page_.title;
+        // Obsidian shows the file name as the note title, so no "# Title" line there.
+        if (!obs_) {
+            out_ += "# " + inline_escape_line(title) + "\n";
+            last_ = Last::Para;
         }
-        out_ += "# " + inline_escape_line(page_.title.empty() ? "Untitled Page" : page_.title) + "\n";
-        last_ = Last::Para;
-        if (opts_.include_date && !opts_.front_matter && !page_.title_date.empty()) block("*" + md_escape(page_.title_date) + "*", "", false);
+        if (opts_.include_date && !opts_.front_matter && !page_.title_date.empty()) block("*" + esc(page_.title_date) + "*", "", false);
 
         for (const PageItem& item : flow_items(page_)) {
             switch (item.kind) {
@@ -67,13 +160,41 @@ public:
             }
         }
         if (!out_.empty() && out_.back() != '\n') out_ += "\n";
-        return out_;
+
+        // The front matter comes last because the body decides which tags the page has.
+        std::string head;
+        if (opts_.front_matter) {
+            head += "---\n";
+            if (obs_) {
+                // The original title stays findable when the file name had to be changed
+                if (title != ctx_.stem) head += "aliases:\n  - " + yaml_str(title) + "\n";
+            } else {
+                head += "title: " + yaml_str(title) + "\n";
+            }
+            if (!page_.created.empty()) head += "created: " + page_.created + "\n";
+            if (!page_.modified.empty()) head += "modified: " + page_.modified + "\n";
+            if (!page_.author.empty()) head += "author: " + yaml_str(page_.author) + "\n";
+            if (!page_.id.empty()) head += "onenote-id: " + yaml_str(page_.id) + "\n";
+            if (obs_ && !ctx_.parent_wiki.empty()) head += "parent: " + yaml_str("[[" + ctx_.parent_wiki + "]]") + "\n";
+            if (obs_ && !page_tags_.empty()) {
+                head += "tags:\n";
+                for (const auto& t : page_tags_) head += "  - " + t + "\n";
+            }
+            head += "---\n";
+            if (!obs_) head += "\n";
+        } else {
+            size_t first = out_.find_first_not_of('\n');
+            out_.erase(0, first == std::string::npos ? out_.size() : first);
+        }
+        return head + out_;
     }
 
 private:
     const Page& page_;
     PageContext& ctx_;
     const Options& opts_;
+    const bool obs_;
+    std::vector<std::string> page_tags_;  // Obsidian tags used on this page, in order of appearance
     std::string out_;
     enum class Last { None, Para, ListItem } last_ = Last::None;
 
@@ -85,7 +206,26 @@ private:
         last_ = list_item ? Last::ListItem : Last::Para;
     }
 
-    static std::string inline_escape_line(const std::string& s) { return md_escape(replace_all(s, "\n", " ")); }
+    std::string esc(const std::string& s) const { return obs_ ? obsidian_escape(s) : md_escape(s); }
+
+    /// Escape running text, but leave bare URLs untouched: viewers turn them into links,
+    /// and an escaped "\_" inside would end up in the address.
+    std::string esc_text(const std::string& s) const {
+        std::string out;
+        size_t pos = 0;
+        while (pos < s.size()) {
+            size_t a = std::min(s.find("http://", pos), s.find("https://", pos));
+            if (a == std::string::npos) break;
+            size_t b = a;
+            while (b < s.size() && !std::isspace(static_cast<unsigned char>(s[b])) && s[b] != '<' && s[b] != '>' && s[b] != '"') ++b;
+            while (b > a && std::strchr(".,;:!?)]'", s[b - 1])) --b;  // sentence punctuation is not part of the URL
+            out += esc(s.substr(pos, a - pos));
+            out += s.substr(a, b - a);
+            pos = b;
+        }
+        return out + esc(s.substr(pos));
+    }
+    std::string inline_escape_line(const std::string& s) const { return esc(replace_all(s, "\n", " ")); }
 
     // ------------------------------------------------------------------ inline
 
@@ -96,13 +236,14 @@ private:
         while (b > a && (raw[b - 1] == ' ' || raw[b - 1] == '\t')) --b;
         std::string lead = raw.substr(0, a), core = raw.substr(a, b - a), tail = raw.substr(b);
         if (core.empty()) return raw;
-        std::string s = md_escape(core);
+        std::string s = esc_text(core);
         if (opts_.md_html_tags) {
             if (st.superscript) s = "<sup>" + s + "</sup>";
             if (st.subscript) s = "<sub>" + s + "</sub>";
             if (st.underline) s = "<u>" + s + "</u>";
-            if (st.highlight) s = "<mark>" + s + "</mark>";
+            if (st.highlight && !obs_) s = "<mark>" + s + "</mark>";
         }
+        if (st.highlight && obs_) s = "==" + s + "==";
         if (st.strike) s = "~~" + s + "~~";
         if (st.bold && st.italic)
             s = "***" + s + "***";
@@ -138,14 +279,22 @@ private:
                 continue;
             }
             if (in.kind == Inline::Kind::Text && !in.href.empty()) {
-                std::string label;
+                std::string label, plain;
                 size_t j = i;
                 while (j < ins.size() && ins[j].kind == Inline::Kind::Text && ins[j].href == in.href) {
                     label += format_text(ins[j].text, ins[j].style);
+                    plain += ins[j].text;
                     ++j;
                 }
+                if (obs_) {
+                    if (const LinkTable::Target* t = ctx_.find_internal(in.href)) {
+                        lines.back() += wikilink(t->wiki, plain, in_table);
+                        i = j;
+                        continue;
+                    }
+                }
                 std::string target = ctx_.resolve_link(in.href);
-                if (trim(label).empty()) label = md_escape(in.href);
+                if (trim(label).empty()) label = esc(in.href);
                 lines.back() += "[" + label + "](" + md_url(target) + ")";
                 i = j;
                 continue;
@@ -157,7 +306,7 @@ private:
                         std::string tex = math_to_latex(*in.math);
                         if (!trim(tex).empty()) lines.back() += "$" + tex + "$";
                     } else {
-                        lines.back() += md_escape(in.text);
+                        lines.back() += esc(in.text);
                     }
                     break;
                 case Inline::Kind::Ink:
@@ -176,7 +325,9 @@ private:
     std::string join_lines(const std::vector<std::string>& lines, const std::string& cont_indent) {
         std::string s;
         for (size_t i = 0; i < lines.size(); ++i) {
-            if (i) s += "\\\n" + cont_indent;
+            // Hard line break: backslash in CommonMark; two spaces for Obsidian, whose
+            // live preview does not treat the backslash form as a break.
+            if (i) s += std::string(obs_ ? "  \n" : "\\\n") + cont_indent;
             s += lines[i];
         }
         return s;
@@ -192,6 +343,20 @@ private:
         return s;
     }
 
+    /// Obsidian: " #important" for each tag, so OneNote tags stay searchable.
+    std::string tag_suffix(const std::vector<NoteTag>& tags) {
+        std::string s;
+        if (!obs_) return s;
+        for (const auto& t : tags) {
+            if (t.is_checkbox() && t.shape == 3) continue;  // the plain "To Do" tag is just a task
+            std::string slug = tag_slug(t.label);
+            if (slug.empty()) continue;
+            s += " #" + slug;
+            if (std::find(page_tags_.begin(), page_tags_.end(), slug) == page_tags_.end()) page_tags_.push_back(slug);
+        }
+        return s;
+    }
+
     // ------------------------------------------------------------------ blocks
 
     std::string paragraph_md(const Paragraph& p, const std::string& cont_indent, bool in_list, bool skip_checkbox) {
@@ -203,20 +368,23 @@ private:
         }
         std::vector<std::string> lines = inlines(p.inlines);
         std::string prefix = tag_prefix(p.tags, skip_checkbox);
+        std::string suffix = tag_suffix(p.tags);
         int level = p.heading_level();
         if (p.style_id == "PageTitle") level = 1;
         if (level > 0) {
             std::string text;
             for (const auto& l : lines) text += (text.empty() ? "" : " ") + l;
             if (trim(text).empty()) return "";
-            if (in_list) return prefix + "**" + trim(text) + "**";
-            int n = std::min(6, level + opts_.heading_offset);
-            return std::string(static_cast<size_t>(n), '#') + " " + prefix + trim(text);
+            if (in_list) return prefix + "**" + trim(text) + "**" + suffix;
+            int n = std::max(1, std::min(6, level + opts_.heading_offset));
+            return std::string(static_cast<size_t>(n), '#') + " " + prefix + trim(text) + suffix;
         }
+        for (auto& l : lines) l = escape_line_start(l);
         if (!lines.empty()) lines[0] = prefix + lines[0];
         std::string body = join_lines(lines, cont_indent + (p.style_id == "blockquote" ? "> " : ""));
         if (p.style_id == "blockquote") body = "> " + body;
         if (p.style_id == "cite" && !trim(body).empty() && body.find('\n') == std::string::npos) body = "*" + body + "*";
+        if (!trim(body).empty()) body += suffix;
         return body;
     }
 
@@ -341,6 +509,7 @@ private:
                         auto lines = inlines(c.paragraph->inlines, true);
                         s = tag_prefix(c.paragraph->tags, true);
                         for (auto& l : lines) s += l;
+                        if (!trim(s).empty()) s += tag_suffix(c.paragraph->tags);
                         break;
                     }
                     case Content::Kind::Table: {
@@ -386,7 +555,7 @@ private:
                 for (size_t ci = 0; ci < cols; ++ci) s += " --- |";
             }
         }
-        std::string tags = tag_prefix(t.tags, false);
+        std::string tags = trim(tag_prefix(t.tags, false) + tag_suffix(t.tags));
         if (!tags.empty()) s = tags + "\n\n" + cont_indent + s;
         return s;
     }
@@ -395,7 +564,7 @@ private:
 
     std::string image_md(const Image& img, bool compact = false) {
         std::string alt = !img.alt.empty() ? img.alt : (!generic_image_name(img.filename) ? img.filename : "image");
-        alt = replace_all(replace_all(md_escape(replace_all(alt, "\n", " ")), "\r", ""), "  ", " ");
+        alt = replace_all(replace_all(esc(replace_all(alt, "\n", " ")), "\r", ""), "  ", " ");
         std::string s;
         if (img.missing || img.data.empty()) {
             s = "*[image unavailable: " + alt + "]*";
@@ -406,12 +575,24 @@ private:
             if (!generic_image_name(img.filename) && !img.ext.empty() && !ends_with(to_lower(name), to_lower(img.ext)))
                 name += img.ext;
             fs::path p = ctx_.assets->write(img.data, name);
-            s = "![" + alt + "](" + md_url(ctx_.rel(p)) + ")";
-            if (!img.link.empty()) s = "[" + s + "](" + md_url(ctx_.resolve_link(img.link)) + ")";
+            std::string file = path_utf8(p.filename());
+            if (obs_ && img.link.empty()) {
+                if (obsidian_image(file)) {
+                    // ![[file|width]] keeps the size the picture had on the OneNote page
+                    long w = img.width > 0 ? std::lround(img.width * 48.0f) : 0;
+                    s = wikilink(file, w >= 16 && w <= 4000 ? std::to_string(w) : "", compact, true);
+                } else {
+                    s = "🖼️ " + wikilink(file, "", compact);  // e.g. EMF/TIFF: not displayable
+                }
+            } else {
+                // A picture that is itself a hyperlink needs standard syntax (also valid in Obsidian)
+                s = "![" + alt + "](" + md_url(ctx_.rel(p)) + ")";
+                if (!img.link.empty()) s = "[" + s + "](" + md_url(ctx_.resolve_link(img.link)) + ")";
+            }
         }
-        s = tag_prefix(img.tags, false) + s;
+        s = tag_prefix(img.tags, false) + s + tag_suffix(img.tags);
         if (!compact)
-            for (const auto& e : img.embeds) s += "\n\n[▶ " + md_escape(e) + "](" + md_url(e) + ")";
+            for (const auto& e : img.embeds) s += "\n\n[▶ " + esc(e) + "](" + md_url(e) + ")";
         return s;
     }
 
@@ -420,16 +601,23 @@ private:
                            : a.media == Attachment::Media::Video ? "\U0001F3AC"
                                                                  : "\U0001F4CE";
         std::string s = tag_prefix(a.tags, false);
-        if (a.missing || a.data.empty()) return s + icon + " " + md_escape(a.name) + " *(file not available)*";
+        if (a.missing || a.data.empty()) return s + icon + " " + esc(a.name) + " *(file not available)*";
         fs::path p = ctx_.assets->write(a.data, a.name);
+        if (obs_) {
+            std::string file = path_utf8(p.filename());
+            // Audio, video and PDF play/show inline; other files become a link that opens them
+            if (obsidian_embeddable(file)) return s + wikilink(file, "", false, true) + tag_suffix(a.tags);
+            return s + icon + " " + wikilink(file, "", false) + tag_suffix(a.tags);
+        }
         return s + "[" + icon + " " + md_escape(a.name) + "](" + md_url(ctx_.rel(p)) + ")";
     }
 
     std::string ink_md(const Ink& ink) {
-        if (!opts_.ink || ink.empty()) return ink.recognized_text.empty() ? "" : md_escape(ink.recognized_text);
+        if (!opts_.ink || ink.empty()) return ink.recognized_text.empty() ? "" : esc(ink.recognized_text);
         std::string svg = ink_to_svg(ink, true, ink.recognized_text);
         if (svg.empty()) return "";
         fs::path p = ctx_.assets->write_text(svg, ctx_.slug + "-ink-" + std::to_string(++ctx_.ink_counter) + ".svg");
+        if (obs_) return wikilink(path_utf8(p.filename()), "", false, true);
         std::string alt = ink.recognized_text.empty() ? "ink" : md_escape(ink.recognized_text);
         return "![" + alt + "](" + md_url(ctx_.rel(p)) + ")";
     }

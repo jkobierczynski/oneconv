@@ -1,6 +1,6 @@
 # oneconv
 
-Convert Microsoft OneNote notebooks to **Markdown** and **HTML**.
+Convert Microsoft OneNote notebooks to **Markdown**, **HTML** or an **Obsidian** vault.
 
 `oneconv` is a self-contained C++17 command-line tool. It reads OneNote's native
 binary format directly, so it needs neither OneNote, Windows, nor the Microsoft Graph API.
@@ -49,10 +49,10 @@ sections. Encrypted sections are detected, reported and skipped.
 oneconv [options] <input>...
 
   -o, --output DIR        output directory (default: ./<input>-export)
-  -f, --format FORMAT     md, html or both (default: md)
+  -f, --format FORMAT     md, html, both or obsidian (default: md)
       --html-layout MODE  flow (default) or canvas (absolute positions like OneNote)
       --heading-offset N  shift OneNote headings down N levels (default 1:
-                          Heading 1 becomes ## below the page title)
+                          Heading 1 becomes ## below the page title; 0 for obsidian)
       --no-front-matter   no YAML front matter in Markdown pages
       --no-html-in-md     pure Markdown: drop <u>, <sup>, <sub> and <mark>
       --no-ink            skip ink drawings / handwriting
@@ -69,8 +69,11 @@ Examples:
 # A whole notebook folder (e.g. synced OneDrive folder or OneNote 2016 local notebook)
 oneconv -f both -o ~/export "~/Documents/OneNote Notebooks/Work"
 
-# A single section, Markdown for Obsidian / Joplin / a static site
+# A single section, plain Markdown for Joplin, a static site, Git, ...
 oneconv -o notes "Meeting Notes.one"
+
+# Straight into an Obsidian vault
+oneconv -f obsidian -o ~/Vault/OneNote Work.onepkg
 
 # What's inside a package?
 oneconv --list Project.onepkg
@@ -93,6 +96,38 @@ export/
 File names are sanitised so they are valid on Windows, macOS and Linux; duplicate page titles
 get ` (2)`, ` (3)` suffixes. Markdown pages carry YAML front matter (`title`, `created`,
 `modified`, `author`, `onenote-id`), which Obsidian, Hugo, Jekyll and most other tools read.
+
+### Obsidian
+
+`-f obsidian` writes notes in Obsidian's own dialect. Point `-o` at a folder inside your vault
+(or open the output folder as a vault).
+
+| OneNote | In the vault |
+|---|---|
+| Notebook → section group → section → page | folders, one note per page; the note is named after the page title |
+| Links between pages | `[[Page]]`, or `[[Section/Page\|Page]]` when two pages share a name |
+| Subpages | `parent: "[[Parent page]]"` property, and nested in the contents note |
+| Notebook structure | a contents note named after the notebook (`Work.md`) linking every page |
+| Images | `![[picture.png\|320]]` embeds at the size they had in OneNote |
+| Audio / video recordings, PDFs | `![[recording.wav]]` embeds, played or shown inline |
+| Other attachments | `[[report.docx]]` links |
+| Ink and handwriting | `![[page-ink-1.svg]]` |
+| To-do tags | tasks: `- [ ]` / `- [x]` |
+| Other tags (Important, Question, …) | their symbol plus an Obsidian tag: `⭐ Call the supplier #important`; all tags of a page are also listed in its `tags` property |
+| Highlighted text | `==highlight==` |
+| Equations | `$…$` and `$$…$$` (MathJax) |
+| Title, dates, author | properties `aliases` (if the file name had to differ from the title), `created`, `modified`, `author`, `onenote-id` |
+
+Details:
+
+* There is no `# Title` line because Obsidian shows the file name as the title, so OneNote's
+  *Heading 1* becomes `#` (change with `--heading-offset`).
+* Characters that break Obsidian links (`# ^ [ ] |`) are replaced in file names; the original
+  title is kept as an alias, so search and `[[` completion still find it.
+* Attachment and image file names are unique across the whole export, so embeds never
+  point at the wrong file.
+* Text that would accidentally become Obsidian syntax (`#word`, `==`, `%%`) is escaped.
+* Links into notebooks that are not part of the export stay `onenote:` links.
 
 ### Getting your notebooks as files
 
@@ -156,7 +191,7 @@ binaries use), `-DONECONV_VERSION_STRING=x.y.z` sets the version shown by `--ver
 
 * `oneconv_tests` — unit tests: GUID/ExGUID encodings, UTF-16 decoding, property set
   reference bookkeeping, equation → LaTeX/MathML, DEFLATE and LZX decoding (fixtures
-  cross-checked against `cabextract`), Markdown/HTML rendering and link rewriting.
+  cross-checked against `cabextract`), Markdown/HTML/Obsidian rendering and link rewriting.
 * `tests/run_samples.sh` — fetches the public OneNote sample corpora of the
   [onenote.rs](https://github.com/msiemens/onenote.rs) and
   [Apache Tika](https://github.com/apache/tika) projects and converts every file.
@@ -166,6 +201,9 @@ binaries use), `-DONECONV_VERSION_STRING=x.y.z` sets the version shown by `--ver
 During development the converter was run over 68 sample files in both on-disk formats
 (page counts match the onenote.rs reference snapshots) and over ~860 randomly corrupted
 OneNote files and cabinets under AddressSanitizer/UBSan without crashes or hangs.
+The Obsidian output was checked in Obsidian 1.13 itself: a test vault of 69 exported notes
+was opened and its link index queried, and all 159 links and embeds resolved to the
+intended files, including same-named pages and exports placed in a subfolder of the vault.
 
 ## Source layout
 

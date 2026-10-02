@@ -5,6 +5,7 @@
 #include <filesystem>
 #include <fstream>
 #include <iostream>
+#include <set>
 #include <sstream>
 #include <string>
 
@@ -266,10 +267,113 @@ static void test_markdown_render() {
     CHECK(html.find("<ol><li>nested</li></ol>") != std::string::npos);
 }
 
+static void test_obsidian_render() {
+    using namespace model;
+    Page page;
+    page.title = "Plan: Q3 [draft]";
+    page.id = "{11111111-1111-1111-1111-111111111111}";
+    auto outline = std::make_shared<Outline>();
+
+    Paragraph tagged = para("Call #support about ==this==");
+    NoteTag important;
+    important.label = "Remember for later";
+    important.shape = 13;
+    tagged.tags.push_back(important);
+    outline->elements.push_back(element(tagged));
+
+    Paragraph rich;
+    Inline hl;
+    hl.text = "marked";
+    hl.style.highlight = Color{255, 255, 0};
+    Inline link;
+    link.text = "other page";
+    link.href = "onenote:#Other&section-id={22222222-2222-2222-2222-222222222222}"
+                "&page-id={88D803A5-4F43-48D4-9B16-4C024F5787DC}&end";
+    Inline br;
+    br.kind = Inline::Kind::Break;
+    Inline url;
+    url.text = "see https://example.com/a_b_c.";
+    rich.inlines = {hl, link, br, url};
+    outline->elements.push_back(element(rich));
+    outline->elements.push_back(element(para("# not a heading")));
+    outline->elements.push_back(element(para("1. not a list")));
+    outline->elements.push_back(element(para("Real heading", "h1")));
+
+    auto image = std::make_shared<Image>();
+    image->data = Blob::from_vector({0x89, 'P', 'N', 'G', 1, 2, 3, 4});
+    image->ext = ".png";
+    image->width = 5.0f;  // half-inches -> 240 px
+    OutlineElement img_el;
+    Content ic;
+    ic.kind = Content::Kind::Image;
+    ic.image = image;
+    img_el.contents.push_back(ic);
+    outline->elements.push_back(img_el);
+
+    auto doc = std::make_shared<Attachment>();
+    doc->data = Blob::from_vector({1, 2, 3});
+    doc->name = "report [v2].docx";
+    OutlineElement doc_el;
+    Content dc;
+    dc.kind = Content::Kind::Attachment;
+    dc.attachment = doc;
+    doc_el.contents.push_back(dc);
+    outline->elements.push_back(doc_el);
+
+    PageItem pi;
+    pi.outline = outline;
+    page.items.push_back(pi);
+
+    render::Options opts;
+    opts.flavor = render::MdFlavor::Obsidian;
+    opts.heading_offset = 0;
+    render::LinkTable links;
+    links.pages["{88D803A5-4F43-48D4-9B16-4C024F5787DC}"] = {"/v/S/Other.md", "/v/S/Other.html", "Other"};
+    auto tmp = std::filesystem::temp_directory_path() / "oneconv_test_vault";
+    std::set<std::string> names;
+    render::AssetWriter assets(tmp, &names, true);
+    render::PageContext ctx;
+    ctx.opts = &opts;
+    ctx.links = &links;
+    ctx.assets = &assets;
+    ctx.page_dir = tmp;
+    ctx.slug = "Plan";
+    ctx.stem = "Plan_ Q3 _draft_";
+    ctx.parent_wiki = "Roadmap";
+    std::string md = render::render_markdown(page, ctx);
+
+    CHECK(md.find("# Plan") == std::string::npos);                                  // no title heading
+    CHECK(md.find("aliases:\n  - \"Plan: Q3 [draft]\"") != std::string::npos);       // original title kept
+    CHECK(md.find("parent: \"[[Roadmap]]\"") != std::string::npos);
+    CHECK(md.find("tags:\n  - remember-for-later\n") != std::string::npos);
+    CHECK(md.find("Call \\#support about \\=\\=this\\=\\= #remember-for-later") != std::string::npos);
+    CHECK(md.find("==marked==[[Other|other page]]  \nsee https://example.com/a_b_c.") != std::string::npos);
+    CHECK(md.find("\n\\# not a heading\n") != std::string::npos);
+    CHECK(md.find("\n1\\. not a list\n") != std::string::npos);
+    CHECK(md.find("\n# Real heading\n") != std::string::npos);
+    CHECK(md.find("![[Plan-image-1.png|240]]") != std::string::npos);
+    CHECK(md.find("[[report _v2_.docx]]") != std::string::npos);                      // link-safe file name
+    CHECK(names.count("plan-image-1.png") == 1);
+
+    // The standard flavour is unaffected
+    opts.flavor = render::MdFlavor::Standard;
+    opts.heading_offset = 1;
+    render::AssetWriter assets2(tmp);
+    ctx.assets = &assets2;
+    ctx.image_counter = 0;
+    std::string std_md = render::render_markdown(page, ctx);
+    CHECK(std_md.find("# Plan: Q3 \\[draft\\]\n") != std::string::npos);
+    CHECK(std_md.find("<mark>marked</mark>[other page](") != std::string::npos);
+    CHECK(std_md.find("![image](Plan-image-1.png)") != std::string::npos);
+    CHECK(std_md.find("#remember") == std::string::npos);
+    std::error_code ec;
+    std::filesystem::remove_all(tmp, ec);
+}
+
 static void test_internal_links() {
     render::Options opts;
     render::LinkTable links;
-    links.pages["{88D803A5-4F43-48D4-9B16-4C024F5787DC}"] = {"/out/Sec/Target Page.md", "/out/Sec/Target Page.html"};
+    links.pages["{88D803A5-4F43-48D4-9B16-4C024F5787DC}"] = {"/out/Sec/Target Page.md", "/out/Sec/Target Page.html", "Target Page"};
     render::PageContext ctx;
     ctx.opts = &opts;
     ctx.links = &links;
@@ -294,6 +398,7 @@ int main() {
     test_lzx_cab();
     test_garbage_store();
     test_markdown_render();
+    test_obsidian_render();
     test_internal_links();
     std::cout << g_passed << " checks passed, " << g_failed << " failed\n";
     return g_failed ? 1 : 0;

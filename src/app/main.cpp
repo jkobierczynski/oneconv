@@ -46,10 +46,12 @@ void usage(std::ostream& os) {
           "\n"
           "Options:\n"
           "  -o, --output DIR        output directory (default: ./<input>-export)\n"
-          "  -f, --format FORMAT     md, html or both (default: md)\n"
+          "  -f, --format FORMAT     md, html, both or obsidian (default: md)\n"
+          "                          obsidian writes an Obsidian vault: [[wikilinks]], embeds,\n"
+          "                          #tags, ==highlights== and note properties\n"
           "      --html-layout MODE  flow (default) or canvas (absolute positions like OneNote)\n"
           "      --heading-offset N  shift OneNote headings down N levels (default: 1, so\n"
-          "                          Heading 1 becomes ## below the page title)\n"
+          "                          Heading 1 becomes ## below the page title; 0 for obsidian)\n"
           "      --no-front-matter   do not write YAML front matter in Markdown pages\n"
           "      --no-html-in-md     pure Markdown: drop <u>, <sup>, <sub> and <mark>\n"
           "      --no-ink            do not export ink drawings / handwriting\n"
@@ -103,7 +105,7 @@ int run(const std::vector<std::string>& args) {
     LoadOptions load_opts;
     std::vector<std::string> inputs;
     std::string output;
-    bool list = false, do_dump = false;
+    bool list = false, do_dump = false, heading_offset_set = false;
     int verbosity = 1;
 
     for (size_t i = 0; i < args.size(); ++i) {
@@ -126,16 +128,21 @@ int run(const std::vector<std::string>& args) {
             output = value("--output");
         } else if (a == "-f" || a == "--format") {
             std::string f = to_lower(value("--format"));
+            opts.flavor = render::MdFlavor::Standard;
             if (f == "md" || f == "markdown") {
                 opts.markdown = true;
                 opts.html = false;
+            } else if (f == "obsidian") {
+                opts.markdown = true;
+                opts.html = false;
+                opts.flavor = render::MdFlavor::Obsidian;
             } else if (f == "html") {
                 opts.markdown = false;
                 opts.html = true;
             } else if (f == "both" || f == "all") {
                 opts.markdown = opts.html = true;
             } else {
-                throw std::runtime_error("unknown format '" + f + "' (use md, html or both)");
+                throw std::runtime_error("unknown format '" + f + "' (use md, html, both or obsidian)");
             }
         } else if (a == "--html-layout") {
             std::string m = to_lower(value("--html-layout"));
@@ -143,6 +150,7 @@ int run(const std::vector<std::string>& args) {
             opts.html_canvas = m == "canvas";
         } else if (a == "--heading-offset") {
             opts.heading_offset = std::stoi(value("--heading-offset"));
+            heading_offset_set = true;
             if (opts.heading_offset < 0 || opts.heading_offset > 5) throw std::runtime_error("--heading-offset must be 0..5");
         } else if (a == "--no-front-matter") {
             opts.front_matter = false;
@@ -171,6 +179,9 @@ int run(const std::vector<std::string>& args) {
         }
     }
     Log::level() = static_cast<LogLevel>(std::min(verbosity, 3));
+    // An Obsidian note has no "# Title" line (the file name is the title), so OneNote's
+    // Heading 1 can be a real top-level heading unless the user asked otherwise.
+    if (opts.flavor == render::MdFlavor::Obsidian && !heading_offset_set) opts.heading_offset = 0;
 
     if (inputs.empty()) {
         usage(std::cerr);
